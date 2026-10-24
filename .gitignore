@@ -1,0 +1,8 @@
+config.yaml
+logs/
+__pycache__/
+*.pyc
+.venv/
+tests/_last_result.json
+tests/_*.json
+tests/_*.py

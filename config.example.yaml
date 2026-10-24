@@ -1,0 +1,73 @@
+# QQ-add-on-for-SynapseAgent 配置示例
+# 使用方式：复制本文件为 config.yaml 后填入 AppID / AppSecret
+
+# ===== 必填：QQ 开放平台机器人凭证 =====
+app_id: "你的AppID"
+app_secret: "你的AppSecret"
+
+# ===== 事件订阅 Intents =====
+# 群聊/单聊事件 (1 << 25) = 33554432
+# 频道 @机器人 (1 << 30)  = 1073741824
+# 默认两者都订阅；如连接时报权限错误，可只保留 1<<25
+intents: 1107296256
+
+# ===== 回复模式 =====
+# fixed: 固定文本回复（仅用于联调链路）
+# agent: 转发给后端 SynapseAgent（周期性 HTTP POST 轮询）
+reply_mode: "agent"
+
+# 固定回复内容（reply_mode=fixed 时生效）
+reply_text: "你好，我是 SynapseAgent（联调中）。收到你的消息啦～"
+
+# ===== 后端 Agent（reply_mode=agent 时生效）=====
+# SynapseAgent server.py 的接口地址
+agent_endpoint: "http://127.0.0.1:56700/cnmd"
+# 轮询 answer 的间隔（秒）
+agent_poll_interval: 3.0
+# 单次 HTTP 请求超时（秒）
+agent_timeout: 15.0
+# 单条消息从投递到彻底放弃的总上限（秒），含分段生成
+agent_pending_timeout: 300.0
+# 首次拿到内容的宽限期（秒），超过则判定 Agent 无响应
+agent_first_reply_timeout: 60.0
+# 合并窗口（秒）：收到新内容就重新计时，空闲超过该时长才发出
+# 15 秒内的多段输出会合并成一条（换行连接），超出则先发出并重新计时
+agent_merge_idle: 15.0
+# 群聊 @机器人 时是否在内容前加上发言者名字
+# 仅群聊生效：单聊/频道/频道私信一律不加前缀，与此开关无关
+# 群聊拿不到真实昵称，用 openid 短哈希代替（如 用户8f3a）
+agent_include_author: true
+# 启动时写入后端系统提示词的文件（相对项目根目录），留空跳过初始化
+agent_prompt_file: "prompt.md"
+# 等待后端确认提示词设置的最长时间（秒）
+agent_prompt_timeout: 90.0
+# 待投递队列长度上限
+agent_queue_size: 32
+
+# ===== 媒体附件（图片/音频/视频）=====
+# 是否把附件下载后 base64 编码交给 Agent 多模态解析
+# 编码后以 <image>…</image> / <audio>…</audio> / <video>…</video> 形式追加到消息内容
+agent_media_enabled: true
+# 单个附件上限（字节），超过则降级为 URL，2MB = 2097152
+agent_media_max_bytes: 2097152
+# 单条消息所有附件合计上限（字节），8MB = 8388608
+agent_media_total_bytes: 8388608
+# 单个附件下载超时（秒）
+agent_media_timeout: 20.0
+# 无法下载/超限时是否改用 URL 形式交给 Agent
+agent_media_url_fallback: true
+
+# ===== 分片参数 [当前分片, 总分片] =====
+shard: [0, 1]
+
+# ===== 网络端点（一般无需修改）=====
+token_urls:
+  - "https://bots.qq.com/app/getAppAccessToken"
+  - "https://api.bot.qq.com/app/getAppAccessToken"
+api_bases:
+  - "https://api.sgroup.qq.com"
+  - "https://api.bot.qq.com"
+
+# ===== 日志 =====
+log_level: "INFO"
+log_dir: "logs"
