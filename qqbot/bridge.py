@@ -22,6 +22,11 @@ _TIMEOUT_HINT = "（响应超时，请稍后重试）"
 _AGENT_DOWN_HINT = "（Agent 暂时不可用，请稍后重试）"
 _TRUNCATED_HINT = "\n...（内容过长，已截断）"
 
+# 仅群聊生效：Agent 每次轮询取回的单条内容若以这些前缀开头，视为内部/调试
+# 输出，不参与最终回复的拼接（判断在 strip_tool_calls 之后进行）。
+# 单聊/频道/频道私信不做过滤，内容原样拼接。
+_REPLY_IGNORE_PREFIXES = ("[D]", "[U]")
+
 # QQ 被动回复对同一 msg_id 的 msg_seq 最多到 5 次，留 1 次余量。
 # 这是平台硬约束，不是设计选择：超出的内容发不出去。
 MAX_REPLY_SEGMENTS = 4
@@ -88,6 +93,14 @@ class AgentBridge:
       - status=1          → Agent 仍在生成
       - status=0 且有内容 → 本轮结束
       - status=0 且无内容 → Agent 尚未开始产出，继续等待（受首响应宽限期约束）
+
+    过滤语义（**仅群聊**）：
+      - 群聊中 answer 取回的单条内容（去掉工具调用标签后）若以
+        _REPLY_IGNORE_PREFIXES 中任一前缀开头，则不参与最终回复的拼接
+      - 但它同样算作"已收到内容"：照常置 _got_content、重置空闲计时，
+        因此不计入首响应宽限期，也不会触发"未返回内容"提示
+      - 若本轮内容全部被过滤，缓冲区为空，_flush() 直接返回，静默结束
+      - 单聊/频道/频道私信一律不过滤，内容原样拼接
     """
 
     def __init__(
@@ -137,10 +150,10 @@ class AgentBridge:
         ]
         log.info(
             "Agent 桥接已启动（endpoint=%s 轮询=%.1fs 首响应宽限=%.0fs "
-            "合并窗口=%.0fs 最多%d条 发言者前缀=%s）",
+            "合并窗口=%.0fs 最多%d条 发言者前缀=%s 群聊忽略前缀=%r）",
             self._client.endpoint, self._client.poll_interval,
             self._first_reply_timeout, self._merge_idle, self._max_segments,
-            "开" if self._include_author else "关",
+            "开" if self._include_author else "关", _REPLY_IGNORE_PREFIXES,
         )
 
     async def stop(self) -> None:
@@ -211,6 +224,28 @@ class AgentBridge:
         self._buffer.append(text)
         self._got_content = True
         self._flush_deadline = time.monotonic() + self._merge_idle
+
+    def _accept_chunk(self, message: IncomingMessage, response: str) -> None:
+        """接收 Agent 轮询返回的单条内容，必要时过滤。
+
+        过滤仅在群聊生效：单聊/频道/频道私信不做前缀判断，内容原样拼接。
+        过滤点在去工具调用标签之后：这样前缀前若夹着调用标签也能识别。
+        被过滤的内容同样算作"已收到内容"：照常刷新 _got_content 与空闲计时，
+        只是不加入缓冲区，不参与最终回复的拼接。
+        """
+        chunk = strip_tool_calls(response)
+        if not chunk:
+            return
+        if message.kind == "group" and chunk.startswith(_REPLY_IGNORE_PREFIXES):
+            self._got_content = True
+            self._flush_deadline = time.monotonic() + self._merge_idle
+            log.info(
+                "群聊消息命中忽略前缀 %r，不参与拼接 [%s] target=%s：%r",
+                _REPLY_IGNORE_PREFIXES, message.kind, message.target_id,
+                chunk[:80],
+            )
+            return
+        self._append(chunk)
 
     def _format_payload(self, message: IncomingMessage, content: str) -> str:
         """给消息加发言者前缀（仅群聊生效）。
@@ -376,11 +411,13 @@ class AgentBridge:
                     log.info("Agent 连接已恢复")
                     self._connected = True
 
-                self._append(strip_tool_calls(response))
+                # 单条内容入口：群聊命中忽略前缀则不参与拼接
+                self._accept_chunk(message, response)
 
                 if status == 0:
                     if self._got_content:
                         # 有内容 + status=0：本轮真正结束，立即发出
+                        # （若内容全被过滤，缓冲区为空，_flush 自然不发任何消息）
                         await self._flush(message)
                         log.info(
                             "Agent 本轮结束（等待 %.1fs，共发 %d 段）",

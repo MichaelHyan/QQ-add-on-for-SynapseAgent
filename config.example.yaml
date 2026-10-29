@@ -71,3 +71,7 @@ api_bases:
 # ===== 日志 =====
 log_level: "INFO"
 log_dir: "logs"
+
+# Base path: ###BASEPATH### in prompt.md is replaced with this path
+# Relative paths resolve against the addon/ directory and become absolute with / separators
+BASE_PATH: "."
