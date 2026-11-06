@@ -21,6 +21,7 @@
 | 断线指数退避重连 | ✅ |
 | 群聊 @机器人 / 单聊 / 频道 / 频道私信 收发 | ✅ |
 | 固定回复模式 | ✅ |
+| 固定指令通道（`/random`） | ✅ |
 | 后端 Agent 模式（ask 投递 + answer 轮询） | ✅ |
 | 分段回复合并（避免刷屏 + 规避 msg_seq 上限） | ✅ |
 | 工具调用标签过滤 | ✅ |
@@ -48,6 +49,7 @@ QQ-add-on-for-SynapseAgent/
 │   ├── api.py               # OpenAPI 封装（网关、消息发送）
 │   ├── gateway.py           # WebSocket 网关客户端
 │   ├── handler.py           # 事件解析 + 回复分发（双模式）
+│   ├── commands.py          # 固定指令通道（/指令 参数）
 │   ├── agent_client.py      # 后端 Agent HTTP 客户端（解析 result 嵌套结构）
 │   ├── bootstrap.py         # 启动时写入 prompt.md 到后端系统提示词
 │   ├── media.py             # 附件下载 + base64 编码（image/audio/video）
@@ -189,7 +191,65 @@ python -m tests.media_check          # MEDIA_CHECK_OK 13 scenarios
 
 ---
 
-## 五、后端 Agent 协议
+## 五、固定指令通道
+
+收到的消息里，**纯信息部分**去掉首尾空格后，如果第一个字符是 `/`，就走本地固定指令通道，由 `qqbot/commands.py` 中注册的函数直接处理，**不再投递给后端 Agent**。`fixed` / `agent` 两种模式都生效。
+
+> 纯信息部分指 `IncomingMessage.content`。群聊里由 `bridge` 追加的 `用户xxxx：` 前缀在投递阶段才拼接，因此不会干扰指令识别。
+
+格式：
+
+```
+/指令名 参数
+```
+
+指令名与参数之间用空白分隔，参数可以省略。
+
+| 指令 | 说明 | 示例 |
+| --- | --- | --- |
+| `/random` | 抽一个 1~100 的随机整数 | `/random` |
+| `/random <上限>` | 抽 1~上限 的随机整数 | `/random 10` |
+| `/random <下限> <上限>` | 在指定区间抽随机整数 | `/random 5 10` |
+
+未注册的指令（例如 `/foo`）只回一条「未知指令」提示并列出当前可用指令，不会转给 Agent。参数不是整数时回用法提示。
+
+### 新增指令（自动注册）
+
+在 `qqbot/commands.py` 里写一个名为 `cmd_<名字>` 的模块级函数，它会**自动**成为 `/<名字>` 指令，不需要任何注册代码：
+
+```python
+def cmd_hello(ctx: CommandContext) -> str:
+    who = ctx.args or "陌生人"
+    return f"你好，{who}"
+```
+
+保存后重启机器人，`/hello` 即可用。指令名取 `cmd_` 之后的部分并转小写：`cmd_ping` → `/ping`。
+
+分发时按模块命名空间实时解析，因此运行期动态往模块里追加（或替换）`cmd_*` 函数也会立即生效。
+
+需要别名时给函数加 `__aliases__`：
+
+```python
+cmd_hello.__aliases__ = ("hi", "hey")   # /hi、/hey 等价于 /hello
+```
+
+`register()` 手动注册仍然保留，优先级高于自动发现，一般情况下用不到。
+
+`CommandContext` 字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` | 指令名（已转小写，不含 `/`） |
+| `args` | 参数原文（已 strip，可能为空串） |
+| `argv` | 参数按空白切分后的列表 |
+| `text` | 完整原始文本 |
+| `message` | 来源 `IncomingMessage`，可取 `kind` / `author_name` 等 |
+
+返回值约定：返回字符串即作为回复发出；返回空串表示「确认是这条指令，但不回复」。
+
+---
+
+## 六、后端 Agent 协议
 
 与 `wechat-add-on-for-SynapseAgent` 完全一致：**周期性 HTTP POST**。
 
@@ -231,7 +291,7 @@ python -m tests.media_check          # MEDIA_CHECK_OK 13 scenarios
 
 ---
 
-## 六、实现要点
+## 七、实现要点
 
 - **鉴权**：`POST /app/getAppAccessToken`，`Authorization: QQBot {access_token}`。token 有效期约 7200s，过期前 60s 内请求会拿到新 token。
 - **被动回复**：群聊/单聊回复必须带原消息 `msg_id`，且同一条消息的 `msg_seq` 需递增（已自动维护）。
@@ -243,7 +303,7 @@ python -m tests.media_check          # MEDIA_CHECK_OK 13 scenarios
 
 ---
 
-## 七、常见问题
+## 八、常见问题
 
 | 现象 | 排查方向 |
 | --- | --- |
@@ -262,7 +322,7 @@ python -m tests.media_check          # MEDIA_CHECK_OK 13 scenarios
 
 ---
 
-## 八、已知限制
+## 九、已知限制
 
 **全局单会话串行**：同一时刻只有一条消息在等 Agent 回复。后果是——A 用户的任务正在生成时，B、C 用户的消息会排队等待，要等 A 完成才轮到。
 

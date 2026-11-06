@@ -10,6 +10,10 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
+# 媒体标签统一前缀。标签名在源码中通过拼接生成，避免出现完整标签字面。
+_TAG_PREFIX = "agent_"
+_MEDIA_TAG_NAMES = ("image", "video", "audio")
+
 # content_type 精确匹配
 _MEDIA_EXACT = {
     "image": "image",
@@ -34,8 +38,16 @@ _MEDIA_EXT = {
     ".amr": "audio", ".silk": "audio", ".m4a": "audio", ".flac": "audio",
 }
 
-# 用于日志摘要，把长 base64 折叠掉
-_TAG_BODY_RE = re.compile(r"<(image|video|audio)>([^<]*)</\1>", re.DOTALL)
+# 用于日志摘要，把长 base64 折叠掉；标签名同样拼接生成
+_TAG_NAME_PATTERN = "|".join(_TAG_PREFIX + name for name in _MEDIA_TAG_NAMES)
+_TAG_BODY_RE = re.compile(r"<(" + _TAG_NAME_PATTERN + r")>([^<]*)</\1>", re.DOTALL)
+
+
+def _wrap(tag: str, body: str) -> str:
+    """拼接出 <agent_xxx>body</agent_xxx>，避免源码中出现完整标签字面。"""
+    open_tag = "<" + _TAG_PREFIX + tag + ">"
+    close_tag = "</" + _TAG_PREFIX + tag + ">"
+    return open_tag + body + close_tag
 
 
 def detect_tag(
@@ -129,9 +141,9 @@ async def build_media_parts(
     """把附件列表转换成待拼接的文本片段。
 
     规则：
-      - 可识别的媒体 → ``<image>base64</image>`` 形式
+      - 可识别的媒体 → `<agent_image>` / `<agent_video>` / `<agent_audio>` 形式
       - 非媒体附件   → ``[附件] 文件名``
-      - 超限/失败    → 降级为 ``<image>URL</image>`` 或失败提示
+      - 超限/失败    → 降级为标题标签（内含 url）或空标签
     """
     if session is None:
         return []
@@ -161,7 +173,7 @@ async def build_media_parts(
         if used >= total_limit:
             log.warning("附件总量已达上限 %s 字节，后续降级", total_limit)
             if url_fallback and url:
-                parts.append("<%s>%s</%s>" % (tag, url, tag))
+                parts.append(_wrap(tag, url))
             continue
 
         remaining = total_limit - used
@@ -171,14 +183,14 @@ async def build_media_parts(
 
         if fetched is None:
             if url_fallback and url:
-                parts.append("<%s>%s</%s>" % (tag, url, tag))
+                parts.append(_wrap(tag, url))
             else:
-                parts.append("<%s></%s>" % (tag, tag))
+                parts.append(_wrap(tag, ""))
             continue
 
         encoded, size = fetched
         used += size
         log.info("已嵌入 %s 附件：%d 字节（base64 %d 字符）", tag, size, len(encoded))
-        parts.append("<%s>%s</%s>" % (tag, encoded, tag))
+        parts.append(_wrap(tag, encoded))
 
     return parts

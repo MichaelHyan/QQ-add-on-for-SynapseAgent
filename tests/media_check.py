@@ -9,6 +9,14 @@ import sys
 from qqbot.handler import MessageHandler
 from qqbot.media import build_media_parts, detect_tag, excerpt_media
 
+# 标签统一由前缀拼接生成，避免源码中出现完整标签字面
+TAG_PREFIX = "agent_"
+
+
+def wrap(name: str, body: str) -> str:
+    """拼出 <agent_name>body</agent_name>。"""
+    return "<" + TAG_PREFIX + name + ">" + body + "</" + TAG_PREFIX + name + ">"
+
 
 class FakeContent:
     def __init__(self, data):
@@ -84,7 +92,7 @@ def s3_image_embedded():
         )
     )
     assert len(parts) == 1, parts
-    expect = "<image>%s</image>" % base64.b64encode(b"IMGBYTES").decode("ascii")
+    expect = wrap("image", base64.b64encode(b"IMGBYTES").decode("ascii"))
     assert parts[0] == expect, parts[0]
     return "image embedded"
 
@@ -100,8 +108,8 @@ def s4_audio_and_video_tags():
     )
     assert len(parts) == 2, parts
     b64 = base64.b64encode(b"DATA").decode("ascii")
-    assert parts[0] == "<audio>%s</audio>" % b64, parts[0]
-    assert parts[1] == "<video>%s</video>" % b64, parts[1]
+    assert parts[0] == wrap("audio", b64), parts[0]
+    assert parts[1] == wrap("video", b64), parts[1]
     return "audio and video tags"
 
 
@@ -113,7 +121,7 @@ def s5_oversize_falls_back_to_url():
             max_bytes=100, total_bytes=4096, timeout=5, url_fallback=True,
         )
     )
-    assert parts == ["<image>http://x/big.png</image>"], parts
+    assert parts == [wrap("image", "http://x/big.png")], parts
     return "oversize fallback to url"
 
 
@@ -125,7 +133,7 @@ def s6_oversize_without_fallback():
             max_bytes=100, total_bytes=4096, timeout=5, url_fallback=False,
         )
     )
-    assert parts == ["<image></image>"], parts
+    assert parts == [wrap("image", "")], parts
     return "oversize without fallback"
 
 
@@ -137,7 +145,7 @@ def s7_download_failure():
             max_bytes=1024, total_bytes=4096, timeout=5, url_fallback=True,
         )
     )
-    assert parts == ["<image>http://x/fail.png</image>"], parts
+    assert parts == [wrap("image", "http://x/fail.png")], parts
     return "download failure fallback"
 
 
@@ -165,8 +173,8 @@ def s9_total_budget():
         )
     )
     assert len(parts) == 2, parts
-    assert parts[0].startswith("<image>") and "base64" not in parts[0]
-    assert parts[1] == "<image>http://x/b.png</image>", parts[1]
+    assert parts[0].startswith("<" + TAG_PREFIX + "image>") and "base64" not in parts[0]
+    assert parts[1] == wrap("image", "http://x/b.png"), parts[1]
     return "total budget"
 
 
@@ -198,7 +206,7 @@ def s11_handler_attaches_media():
     data = {"attachments": [att("image/png", "http://x/a.png")]}
     asyncio.run(handler._attach_media(message, data))
     b64 = base64.b64encode(b"IMG").decode("ascii")
-    assert message.content == "看这个\n<image>%s</image>" % b64, message.content
+    assert message.content == "看这个\n" + wrap("image", b64), message.content
     return "handler attaches media"
 
 
@@ -217,9 +225,9 @@ def s12_handler_media_disabled():
 
 
 def s13_excerpt_media():
-    text = "<image>%s</image>你好" % ("A" * 500)
+    text = wrap("image", "A" * 500) + "你好"
     out = excerpt_media(text)
-    assert "<image>(500 字符)</image>" in out, out
+    assert wrap("image", "(500 字符)") in out, out
     assert len(out) <= 200, len(out)
     assert excerpt_media("") == ""
     assert excerpt_media("纯文本") == "纯文本"

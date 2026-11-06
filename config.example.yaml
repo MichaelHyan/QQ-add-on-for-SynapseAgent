@@ -1,4 +1,4 @@
-# QQ-add-on-for-SynapseAgent 配置示例
+﻿# QQ-add-on-for-SynapseAgent 配置示例
 # 使用方式：复制本文件为 config.yaml 后填入 AppID / AppSecret
 
 # ===== 必填：QQ 开放平台机器人凭证 =====
@@ -46,7 +46,7 @@ agent_queue_size: 32
 
 # ===== 媒体附件（图片/音频/视频）=====
 # 是否把附件下载后 base64 编码交给 Agent 多模态解析
-# 编码后以 <image>…</image> / <audio>…</audio> / <video>…</video> 形式追加到消息内容
+# 编码后以 <agent_image>…</agent_image> / <agent_audio>…</agent_audio> / <agent_video>…</agent_video> 形式追加到消息内容
 agent_media_enabled: true
 # 单个附件上限（字节），超过则降级为 URL，2MB = 2097152
 agent_media_max_bytes: 2097152

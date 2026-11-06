@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional, Protocol
 import aiohttp
 
 from .api import APIError, QQBotAPI
+from .commands import method as handle_command
 from .media import build_media_parts, excerpt_media
 
 log = logging.getLogger(__name__)
@@ -95,7 +96,8 @@ class MessageHandler:
       - Agent 模式：传入 on_message 回调，由外部桥接处理，handler 只负责解析
 
     媒体处理：若事件带 attachments，会把图片/音频/视频下载并 base64 编码，
-    以 ``<image>...</image>`` 形式追加到消息内容，交给后端多模态解析。
+    以 agent_image / agent_video / agent_audio 标签形式追加到消息内容，
+    交给后端多模态解析。
     """
 
     _SUPPORTED = {
@@ -157,6 +159,14 @@ class MessageHandler:
             log.debug("忽略事件 %s", event_type)
             return
 
+        # 固定指令通道：纯信息部分以 / 开头时交给本地指令处理，
+        # 不下载附件、也不投递给后端 Agent。fixed / agent 两种模式都生效。
+        command_reply = self._dispatch_command(message)
+        if command_reply is not None:
+            if command_reply:
+                await self.send_reply(message, command_reply)
+            return
+
         await self._attach_media(message, data)
 
         log.info(
@@ -190,6 +200,20 @@ class MessageHandler:
             return
 
         await self.send_reply(message, reply)
+
+    # ---------------- 固定指令通道 ----------------
+
+    def _dispatch_command(self, message: IncomingMessage) -> Optional[str]:
+        """尝试走固定指令通道。
+
+        返回 ``None`` 表示不是指令，调用方继续原流程；返回字符串表示已处理，
+        内容非空时作为回复发出。
+        """
+        try:
+            return handle_command(message.content, message)
+        except Exception:
+            log.exception("指令通道异常，按普通消息继续处理")
+            return None
 
     # ---------------- 媒体处理 ----------------
 
