@@ -7,6 +7,7 @@ import time
 from typing import Awaitable, Callable, Optional
 
 from .agent_client import AgentClient, AgentError
+from .files import extract_file_tags, wrap_file
 from .handler import IncomingMessage
 
 log = logging.getLogger(__name__)
@@ -15,6 +16,12 @@ log = logging.getLogger(__name__)
 _TAG_OPEN = "<" + "tool_call" + ">"
 _TAG_CLOSE = "</" + "tool_call" + ">"
 _TOOL_CALL_RE = re.compile(_TAG_OPEN + r".*?" + _TAG_CLOSE, re.DOTALL)
+# 取「单个」调用块，用于挑出 sender 伪工具
+_CALL_BLOCK_RE = re.compile(_TAG_OPEN + r"(.*?)" + _TAG_CLOSE, re.DOTALL)
+
+# Agent 端执行 #skipable sender 之后，sender 调用不会真正执行，
+# 而是把调用文本原样回传给 QQ 端。QQ 端把它翻译成「发文件」。
+SENDER_TOOL = "sender"
 
 _EMPTY_HINT = "（请输入具体内容）"
 _NO_RESPONSE_HINT = "（Agent 未返回内容，请稍后重试）"
@@ -29,6 +36,7 @@ _REPLY_IGNORE_PREFIXES = ("[D]", "[U]")
 
 # QQ 被动回复对同一 msg_id 的 msg_seq 最多到 5 次，留 1 次余量。
 # 这是平台硬约束，不是设计选择：超出的内容发不出去。
+# 文本段与文件消息共用这个预算（两者都消耗 msg_seq）。
 MAX_REPLY_SEGMENTS = 4
 # 单条 QQ 消息安全上限（handler 里还有 1800 兜底）
 SEGMENT_LIMIT = 1500
@@ -41,10 +49,44 @@ SendReply = Callable[[IncomingMessage, str], Awaitable[None]]
 
 
 def strip_tool_calls(text: str) -> str:
-    """移除 Agent 输出中的工具调用标签，避免原样发给用户。"""
+    """移除 Agent 输出中的工具调用块，避免原样发给用户。"""
     if not text:
         return ""
     return _TOOL_CALL_RE.sub("", text).strip()
+
+
+def extract_sender_calls(text: str) -> tuple[list[str], str]:
+    """从工具调用块里挑出 sender 的文件路径。
+
+    返回 ``(路径列表, 剩余文本)``。命中的调用块被整体移除，
+    其余调用块原样保留，交给 :func:`strip_tool_calls` 统一剥离。
+
+    容错：
+      - 工具名大小写不敏感
+      - 路径两端可能带引号
+      - 路径内部允许空格（取 sender 之后的全部内容）
+    """
+    if not text:
+        return [], ""
+
+    paths: list[str] = []
+
+    def _replace(match: re.Match) -> str:
+        body = (match.group(1) or "").strip()
+        if not body:
+            return match.group(0)
+        parts = body.split(None, 1)
+        if not parts or parts[0].strip().lower() != SENDER_TOOL:
+            return match.group(0)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        arg = arg.strip().strip('"').strip("'").strip()
+        if not arg:
+            return match.group(0)
+        paths.append(arg)
+        return ""
+
+    rest = _CALL_BLOCK_RE.sub(_replace, text)
+    return paths, rest
 
 
 def split_text(text: str, limit: int = SEGMENT_LIMIT) -> list[str]:
@@ -94,8 +136,13 @@ class AgentBridge:
       - status=0 且有内容 → 本轮结束
       - status=0 且无内容 → Agent 尚未开始产出，继续等待（受首响应宽限期约束）
 
+    文件通道：
+      Agent 端启动时被注入 #skipable sender，因此它调用 sender 时工具不会执行，
+      调用文本会原样回传。本模块把它翻译成文件标签，由 handler 上传并发出文件。
+      文件消息同样消耗 msg_seq，因此与文本段共用条数预算。
+
     过滤语义（**仅群聊**）：
-      - 群聊中 answer 取回的单条内容（去掉工具调用标签后）若以
+      - 群聊中 answer 取回的单条内容（去掉工具调用块后）若以
         _REPLY_IGNORE_PREFIXES 中任一前缀开头，则不参与最终回复的拼接
       - 但它同样算作"已收到内容"：照常置 _got_content、重置空闲计时，
         因此不计入首响应宽限期，也不会触发"未返回内容"提示
@@ -150,10 +197,11 @@ class AgentBridge:
         ]
         log.info(
             "Agent 桥接已启动（endpoint=%s 轮询=%.1fs 首响应宽限=%.0fs "
-            "合并窗口=%.0fs 最多%d条 发言者前缀=%s 群聊忽略前缀=%r）",
+            "合并窗口=%.0fs 最多%d条 发言者前缀=%s 群聊忽略前缀=%r 文件工具=%r）",
             self._client.endpoint, self._client.poll_interval,
             self._first_reply_timeout, self._merge_idle, self._max_segments,
             "开" if self._include_author else "关", _REPLY_IGNORE_PREFIXES,
+            SENDER_TOOL,
         )
 
     async def stop(self) -> None:
@@ -228,12 +276,27 @@ class AgentBridge:
     def _accept_chunk(self, message: IncomingMessage, response: str) -> None:
         """接收 Agent 轮询返回的单条内容，必要时过滤。
 
+        先挑出 sender 伪工具调用（转成文件标签入缓冲区），
+        再把剩余的调用块剥掉，最后才做群聊前缀判断。
+
         过滤仅在群聊生效：单聊/频道/频道私信不做前缀判断，内容原样拼接。
-        过滤点在去工具调用标签之后：这样前缀前若夹着调用标签也能识别。
         被过滤的内容同样算作"已收到内容"：照常刷新 _got_content 与空闲计时，
         只是不加入缓冲区，不参与最终回复的拼接。
         """
-        chunk = strip_tool_calls(response)
+        if not response:
+            return
+
+        paths, rest = extract_sender_calls(response)
+        for path in paths:
+            self._append(wrap_file(path))
+        if paths:
+            log.info(
+                "命中 %s 调用 %d 个 [%s] target=%s：%r",
+                SENDER_TOOL, len(paths), message.kind, message.target_id,
+                paths,
+            )
+
+        chunk = strip_tool_calls(rest)
         if not chunk:
             return
         if message.kind == "group" and chunk.startswith(_REPLY_IGNORE_PREFIXES):
@@ -276,12 +339,19 @@ class AgentBridge:
         )
 
     async def _flush(self, message: IncomingMessage) -> None:
-        """把缓冲区内容发出，必要时切分并受条数上限约束。"""
+        """把缓冲区内容发出。
+
+        文件标签先被拆出来：文本段按 split_text 切分，
+        文件标签单独作为一条投递给 handler（由它上传并发送）。
+        文本与文件都消耗 msg_seq，因此共用 _max_segments 预算。
+        """
         text = self._buffered_text().strip()
         if not text:
             return
         self._buffer = []
         self._flush_deadline = 0.0
+
+        paths, plain = extract_file_tags(text)
 
         remaining = self._max_segments - self._sent_segments
         if remaining <= 0:
@@ -293,24 +363,43 @@ class AgentBridge:
                 )
             return
 
-        chunks = split_text(text)
-        if len(chunks) <= remaining:
-            for chunk in chunks:
-                await self._deliver(message, chunk)
-            return
+        # 先给文件留位；若同时有文字，至少给文字留 1 条
+        file_count = min(len(paths), remaining)
+        text_budget = remaining - file_count
+        if plain and text_budget <= 0 and remaining >= 1:
+            file_count = max(min(len(paths), remaining - 1), 0)
+            text_budget = remaining - file_count
 
-        # 空间不够：留 1 条给截断提示
-        if remaining >= 2:
-            for chunk in chunks[: remaining - 1]:
-                await self._deliver(message, chunk)
-            await self._deliver(message, _TRUNCATED_HINT.strip())
-        else:
-            head = chunks[0][: SEGMENT_LIMIT - len(_TRUNCATED_HINT)].rstrip()
-            await self._deliver(message, head + _TRUNCATED_HINT)
-        self._truncated = True
-        log.warning(
-            "内容超长，已截断 [%s] target=%s", message.kind, message.target_id
-        )
+        if plain and text_budget > 0:
+            chunks = split_text(plain)
+            if len(chunks) <= text_budget:
+                for chunk in chunks:
+                    await self._deliver(message, chunk)
+            else:
+                # 空间不够：留 1 条给截断提示
+                if text_budget >= 2:
+                    for chunk in chunks[: text_budget - 1]:
+                        await self._deliver(message, chunk)
+                    await self._deliver(message, _TRUNCATED_HINT.strip())
+                else:
+                    head = chunks[0][: SEGMENT_LIMIT - len(_TRUNCATED_HINT)].rstrip()
+                    await self._deliver(message, head + _TRUNCATED_HINT)
+                self._truncated = True
+                log.warning(
+                    "内容超长，已截断 [%s] target=%s",
+                    message.kind, message.target_id,
+                )
+
+        for index in range(file_count):
+            await self._deliver(message, wrap_file(paths[index]))
+
+        if len(paths) > file_count:
+            self._truncated = True
+            log.warning(
+                "文件数量超出剩余条数预算（%d/%d），已丢弃 %d 个 [%s] target=%s",
+                file_count, len(paths), len(paths) - file_count,
+                message.kind, message.target_id,
+            )
 
     # ---------------- 投递协程 ----------------
 
@@ -411,7 +500,7 @@ class AgentBridge:
                     log.info("Agent 连接已恢复")
                     self._connected = True
 
-                # 单条内容入口：群聊命中忽略前缀则不参与拼接
+                # 单条内容入口：挑 sender 调用、群聊命中忽略前缀则不参与拼接
                 self._accept_chunk(message, response)
 
                 if status == 0:

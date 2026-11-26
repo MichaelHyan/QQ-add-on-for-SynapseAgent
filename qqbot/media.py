@@ -141,7 +141,6 @@ async def build_media_parts(
     """把附件列表转换成待拼接的文本片段。
 
     规则：
-      - 可识别的媒体 → `<agent_image>` / `<agent_video>` / `<agent_audio>` 形式
       - 非媒体附件   → ``[附件] 文件名``
       - 超限/失败    → 降级为标题标签（内含 url）或空标签
     """

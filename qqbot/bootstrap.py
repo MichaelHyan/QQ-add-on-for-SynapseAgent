@@ -163,6 +163,32 @@ async def _drain(client: AgentClient, rounds: int = 6) -> int:
     return drained
 
 
+async def _wait_idle(
+    client: AgentClient,
+    timeout: float,
+    poll_interval: float = 1.0,
+) -> bool:
+    """轮询 answer 直到后端空闲（status=0 且无新内容）。
+
+    返回是否在超时前观察到空闲。期间出现的非空内容会被记日志并丢弃
+    ——初始化阶段不应该有真实用户输出。
+    """
+    deadline = time.monotonic() + max(float(timeout), 1.0)
+    while time.monotonic() < deadline:
+        await asyncio.sleep(max(float(poll_interval), 0.2))
+        try:
+            status, response = await client.answer()
+        except AgentError as exc:
+            log.debug("初始化期间轮询失败：%s", exc)
+            continue
+        if response:
+            log.info("初始化回应：%s", response[:120])
+            continue
+        if status == 0:
+            return True
+    return False
+
+
 async def bootstrap_prompt(
     client: AgentClient,
     prompt_path: str,
@@ -203,38 +229,52 @@ async def bootstrap_prompt(
         log.warning("提示词投递失败：%s", exc)
         return False
 
-    deadline = time.monotonic() + max(float(timeout), 1.0)
-    got_response = False
-    last_status = None
-
-    while time.monotonic() < deadline:
-        await asyncio.sleep(max(float(poll_interval), 0.2))
-        try:
-            status, response = await client.answer()
-        except AgentError as exc:
-            log.debug("初始化期间轮询失败：%s", exc)
-            continue
-
-        last_status = status
-        if response:
-            got_response = True
-            log.info("初始化回应：%s", response[:120])
-            continue
-
-        # 无内容且后端空闲：说明设置已完成
-        if status == 0:
-            break
+    ok = await _wait_idle(client, timeout, poll_interval)
 
     leftover = await _drain(client)
     if leftover:
         log.info("清理了 %d 条初始化残留响应", leftover)
 
-    if got_response:
+    if ok:
         log.info("提示词初始化完成")
-    elif last_status == 0:
-        log.info("提示词初始化完成（后端未回显）")
     else:
         log.warning("提示词初始化超时（%.0fs），后端可能仍在处理", timeout)
         return False
 
     return True
+
+
+async def bootstrap_commands(
+    client: AgentClient,
+    commands: list[str],
+    timeout: float = 60.0,
+    poll_interval: float = 1.0,
+) -> int:
+    """启动时逐条投递后端指令（如 ``#skipable sender``），返回成功条数。
+
+    必须**在** :func:`bootstrap_prompt` **之后**调用：提示词覆盖会重建
+    Agent 的系统消息与命令表，先发指令会被覆盖掉。
+
+    每条指令投递后等待后端回到空闲，避免指令之间互相打断。
+    """
+    sent = 0
+    for raw in commands or []:
+        command = str(raw or "").strip()
+        if not command:
+            continue
+        try:
+            await client.ask(command)
+        except AgentError as exc:
+            log.warning("指令投递失败 %r：%s", command, exc)
+            continue
+        log.info("已投递启动指令：%r", command)
+        await _wait_idle(client, timeout, poll_interval)
+        sent += 1
+
+    leftover = await _drain(client)
+    if leftover:
+        log.info("清理了 %d 条指令初始化残留响应", leftover)
+
+    if sent:
+        log.info("启动指令初始化完成（%d 条）", sent)
+    return sent

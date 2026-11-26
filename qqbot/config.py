@@ -11,7 +11,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TOKEN_URLS = (
     "https://bots.qq.com/app/getAppAccessToken",
-    "https://api.bot.qq.com/app/getAppAccessToken",
+    "https://api.bot.qq.com/getAppAccessToken",
 )
 
 DEFAULT_API_BASES = (
@@ -24,6 +24,10 @@ INTENT_PUBLIC_GUILD_MESSAGES = 1 << 30  # 频道 @机器人
 
 REPLY_MODE_FIXED = "fixed"
 REPLY_MODE_AGENT = "agent"
+
+# 启动时投递给后端的指令默认值：让 Agent 的工具层跳过 sender，
+# 从而把 sender 调用原样回传给 QQ 端，由 QQ 端真正发文件。
+DEFAULT_SKIPABLE_CMDS = ("#skipable sender",)
 
 
 @dataclass
@@ -55,8 +59,14 @@ class Config:
     agent_include_author: bool = True
     # 启动时写入后端系统提示词的文件（相对项目根目录），空串表示不初始化
     agent_prompt_file: str = "prompt.md"
+    # 是否启用启动时的提示词注入（关闭后仍会投递 agent_skipable_cmds）
+    agent_prompt_inject_enabled: bool = True
     # 等待后端确认提示词设置的最长时间（秒）
     agent_prompt_timeout: float = 90.0
+    # 提示词注入完成后逐条投递的启动指令（如 #skipable sender）
+    agent_skipable_cmds: list[str] = field(
+        default_factory=lambda: list(DEFAULT_SKIPABLE_CMDS)
+    )
     agent_queue_size: int = 32
 
     # ===== 媒体附件 =====
@@ -70,6 +80,18 @@ class Config:
     agent_media_timeout: float = 20.0
     # base64 失败时是否改用 URL 形式交给 Agent
     agent_media_url_fallback: bool = True
+
+    # ===== 文件收发 =====
+    # 是否启用文件收发（收：落盘；发：上传并发送）
+    agent_file_enabled: bool = True
+    # 收到文件的保存目录（相对项目根目录时按项目根解析）
+    agent_file_dir: str = "downloads"
+    # 单个入站文件上限（字节），0 表示不限制（流式落盘）
+    agent_file_max_bytes: int = 0
+    # 单个出站文件上限（字节），0 表示不限制
+    agent_file_send_max_bytes: int = 0
+    # 文件下载超时（秒），大文件给足时间
+    agent_file_timeout: float = 120.0
 
     @property
     def shard_tuple(self) -> tuple[int, int]:
@@ -93,6 +115,17 @@ class Config:
             return name
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return os.path.join(root, name)
+
+    @property
+    def file_dir_path(self) -> str:
+        """收文件目录的绝对路径（相对路径按项目根目录解析）。"""
+        name = (self.agent_file_dir or "").strip()
+        if not name:
+            return ""
+        if os.path.isabs(name):
+            return os.path.normpath(name)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.normpath(os.path.join(root, name))
 
     def validate(self) -> None:
         if not self.app_id or not self.app_secret:
@@ -140,6 +173,8 @@ class Config:
             kwargs["agent_endpoint"] = os.environ["QQ_BOT_AGENT_ENDPOINT"]
         if os.getenv("QQ_BOT_PROMPT_FILE"):
             kwargs["agent_prompt_file"] = os.environ["QQ_BOT_PROMPT_FILE"]
+        if os.getenv("QQ_BOT_FILE_DIR"):
+            kwargs["agent_file_dir"] = os.environ["QQ_BOT_FILE_DIR"]
 
         cfg = cls(**kwargs)
         cfg.config_path = os.path.abspath(path)
@@ -158,6 +193,7 @@ class Config:
             "agent_merge_idle",
             "agent_prompt_timeout",
             "agent_media_timeout",
+            "agent_file_timeout",
         ):
             try:
                 setattr(cfg, name, float(getattr(cfg, name)))
@@ -168,24 +204,59 @@ class Config:
             "agent_queue_size",
             "agent_media_max_bytes",
             "agent_media_total_bytes",
+            "agent_file_max_bytes",
+            "agent_file_send_max_bytes",
         ):
             try:
-                setattr(cfg, name, max(1, int(getattr(cfg, name))))
+                setattr(cfg, name, max(0, int(getattr(cfg, name))))
             except (TypeError, ValueError):
                 setattr(cfg, name, getattr(defaults, name))
+
+        # 队列长度至少 1（其余允许 0 = 不限）
+        if cfg.agent_queue_size < 1:
+            cfg.agent_queue_size = defaults.agent_queue_size
 
         for name in (
             "agent_include_author",
             "agent_media_enabled",
             "agent_media_url_fallback",
+            "agent_file_enabled",
+            "agent_prompt_inject_enabled",
         ):
             setattr(
                 cfg, name, _as_bool(getattr(cfg, name), getattr(defaults, name))
             )
 
         cfg.agent_prompt_file = str(cfg.agent_prompt_file or "").strip()
+        cfg.agent_file_dir = str(cfg.agent_file_dir or "").strip()
+
+        cfg.agent_skipable_cmds = _as_str_list(
+            cfg.agent_skipable_cmds, list(DEFAULT_SKIPABLE_CMDS)
+        )
 
         return cfg
+
+
+def _as_str_list(value: Any, default: list[str]) -> list[str]:
+    """把配置值规范成「非空字符串列表」。
+
+    支持 YAML 列表、单个字符串（按行拆分）、None。
+    """
+    if value is None:
+        return list(default)
+    if isinstance(value, str):
+        items: list[Any] = value.replace("\r", "").split("\n")
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return list(default)
+
+    result: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
 
 
 def _as_bool(value: Any, default: bool) -> bool:

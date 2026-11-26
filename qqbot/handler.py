@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
@@ -10,7 +11,15 @@ import aiohttp
 
 from .api import APIError, QQBotAPI
 from .commands import method as handle_command
-from .media import build_media_parts, excerpt_media
+from .files import (
+    DEFAULT_FILE_MAX_BYTES,
+    download_to_file,
+    extract_file_tags,
+    file_type_of,
+    safe_name,
+    to_base64,
+)
+from .media import build_media_parts, detect_tag, excerpt_media
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +33,9 @@ ERR_DUPLICATE_MSG = 40054005
 DEFAULT_MEDIA_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_MEDIA_TOTAL_BYTES = 8 * 1024 * 1024
 DEFAULT_MEDIA_TIMEOUT = 20.0
+
+# 文件下载默认超时（大文件给足时间）
+DEFAULT_FILE_TIMEOUT = 120.0
 
 
 def clean_content(text: str) -> str:
@@ -95,9 +107,18 @@ class MessageHandler:
       - 固定回复：传入 backend，由 handler 直接回固定文本
       - Agent 模式：传入 on_message 回调，由外部桥接处理，handler 只负责解析
 
-    媒体处理：若事件带 attachments，会把图片/音频/视频下载并 base64 编码，
-    以 agent_image / agent_video / agent_audio 标签形式追加到消息内容，
-    交给后端多模态解析。
+    媒体处理：图片/音频/视频下载后 base64 编码，以 agent_* 标签追加到内容。
+
+    文件处理：
+      - 收：非媒体附件流式落盘到 file_dir，内容追加
+        ``[收到文件] 原文件名 -> 绝对路径``；群聊/单聊/频道私信都落盘
+      - 发：回复文本里的 ``<agent_file>路径</agent_file>`` 先发文字，
+        再把文件上传后以 msg_type=7 发出
+
+    附件降级规则（保证既有行为不变）：
+      - 媒体 + 文件功能都关闭 → 完全不追加，直接返回
+      - 仅文件功能开启 → 媒体附件降级为 ``[附件] 名`` 占位
+      - 文件功能关闭 → 普通附件降级为 ``[附件] 名`` 占位
     """
 
     _SUPPORTED = {
@@ -126,6 +147,11 @@ class MessageHandler:
         media_total_bytes: int = DEFAULT_MEDIA_TOTAL_BYTES,
         media_timeout: float = DEFAULT_MEDIA_TIMEOUT,
         media_url_fallback: bool = True,
+        file_enabled: bool = False,
+        file_dir: str = "",
+        file_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
+        file_send_max_bytes: int = DEFAULT_FILE_MAX_BYTES,
+        file_timeout: float = DEFAULT_FILE_TIMEOUT,
     ) -> None:
         self._api = api
         self._backend = backend
@@ -138,6 +164,12 @@ class MessageHandler:
         self._media_total_bytes = max(int(media_total_bytes), 1)
         self._media_timeout = max(float(media_timeout), 1.0)
         self._media_url_fallback = bool(media_url_fallback)
+
+        self._file_enabled = bool(file_enabled)
+        self._file_dir = str(file_dir or "")
+        self._file_max_bytes = max(int(file_max_bytes), 0)
+        self._file_send_max_bytes = max(int(file_send_max_bytes), 0)
+        self._file_timeout = max(float(file_timeout), 1.0)
 
     # ---------------- 装配 ----------------
 
@@ -215,29 +247,80 @@ class MessageHandler:
             log.exception("指令通道异常，按普通消息继续处理")
             return None
 
-    # ---------------- 媒体处理 ----------------
+    # ---------------- 附件处理 ----------------
 
     async def _attach_media(self, message: IncomingMessage, data: dict) -> None:
-        """把附件下载编码后追加到消息内容。"""
-        if not self._media_enabled or self._session is None:
-            return
-
+        """把附件追加到消息内容（媒体 base64 / 普通文件落盘）。"""
         attachments = data.get("attachments") or []
-        if not attachments:
+        if not attachments or self._session is None:
+            return
+        # 两个功能都关：不追加任何内容，保持既有行为
+        if not self._media_enabled and not self._file_enabled:
             return
 
-        try:
-            parts = await build_media_parts(
+        media_atts: list[Any] = []
+        file_atts: list[Any] = []
+        labels: list[str] = []
+
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            content_type = att.get("content_type") or att.get("contentType") or ""
+            url = att.get("url") or ""
+            filename = att.get("filename") or att.get("file_name") or ""
+            if detect_tag(content_type, filename, url) is not None:
+                if self._media_enabled:
+                    media_atts.append(att)
+                else:
+                    labels.append("[附件] %s" % (filename or url))
+            else:
+                file_atts.append(att)
+
+        parts: list[str] = []
+
+        if media_atts:
+            try:
+                parts.extend(
+                    await build_media_parts(
+                        self._session,
+                        media_atts,
+                        max_bytes=self._media_max_bytes,
+                        total_bytes=self._media_total_bytes,
+                        timeout=self._media_timeout,
+                        url_fallback=self._media_url_fallback,
+                    )
+                )
+            except Exception:
+                log.exception("媒体处理异常，跳过媒体片段")
+
+        parts.extend(labels)
+
+        for att in file_atts:
+            url = att.get("url") or ""
+            filename = att.get("filename") or att.get("file_name") or "file"
+            if not self._file_enabled or not url:
+                label = filename or url
+                if label:
+                    parts.append("[附件] %s" % label)
+                continue
+            path, size = await download_to_file(
                 self._session,
-                attachments,
-                max_bytes=self._media_max_bytes,
-                total_bytes=self._media_total_bytes,
-                timeout=self._media_timeout,
-                url_fallback=self._media_url_fallback,
+                url,
+                filename,
+                message.msg_id,
+                self._file_dir,
+                max_bytes=self._file_max_bytes,
+                timeout=self._file_timeout,
             )
-        except Exception:
-            log.exception("媒体处理异常，按纯文本继续")
-            return
+            if path:
+                parts.append("[收到文件] %s -> %s" % (safe_name(filename), path))
+                log.info(
+                    "已保存文件 [%s] %s（%d 字节）-> %s",
+                    message.kind, filename, size, path,
+                )
+            else:
+                parts.append("[附件] %s" % (filename or url))
+                log.warning("文件保存失败 [%s] %s", message.kind, filename)
 
         if not parts:
             return
@@ -245,7 +328,7 @@ class MessageHandler:
         extra = "\n".join(parts)
         message.content = (message.content + "\n" + extra) if message.content else extra
         log.info(
-            "已附加 %d 个媒体片段，内容长度 %d", len(parts), len(message.content)
+            "已附加 %d 个附件片段，内容长度 %d", len(parts), len(message.content)
         )
 
     # ---------------- 解析 ----------------
@@ -320,7 +403,20 @@ class MessageHandler:
         return seq
 
     async def send_reply(self, message: IncomingMessage, text: str) -> None:
-        """按消息类型发送文本（被动回复，带 msg_id）。"""
+        """按消息类型发送回复：先发文字，再发 ``<agent_file>`` 指定的文件。
+
+        文件标签在执行时被移除，不会出现在文字内容里。
+        """
+        paths, plain = extract_file_tags(text or "")
+        if plain:
+            await self._send_text(message, plain)
+        for path in paths:
+            await self._send_file(message, path)
+
+    async def _send_text(self, message: IncomingMessage, text: str) -> None:
+        """发送纯文本（被动回复，带 msg_id）。"""
+        if not text:
+            return
         if len(text) > MAX_CONTENT_LEN:
             text = text[: MAX_CONTENT_LEN - 3] + "..."
 
@@ -362,6 +458,100 @@ class MessageHandler:
         except Exception:
             log.exception(
                 "回复消息失败 [%s] target=%s", message.kind, message.target_id
+            )
+
+    async def _send_file(self, message: IncomingMessage, path: str) -> None:
+        """上传并发送一个本地文件（群聊 / 单聊支持，频道类跳过）。"""
+        if not self._file_enabled:
+            log.info("文件发送未启用，跳过 %s", path)
+            return
+
+        if message.kind not in ("group", "c2c"):
+            log.warning(
+                "该消息类型不支持发文件 [%s]，跳过 %s", message.kind, path
+            )
+            return
+
+        path = str(path or "").strip()
+        if not path or not os.path.isfile(path):
+            log.warning("文件不存在，跳过发送：%r", path)
+            return
+
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            log.warning("无法读取文件大小，跳过发送：%r", path)
+            return
+
+        limit = self._file_send_max_bytes or self._file_max_bytes
+        if limit and size > limit:
+            log.warning(
+                "文件超过发送上限（%d > %d 字节），跳过：%s", size, limit, path
+            )
+            return
+
+        file_type = file_type_of(path)
+        try:
+            data = to_base64(path)
+        except OSError as exc:
+            log.warning("读取文件失败，跳过发送：%s（%s）", path, exc)
+            return
+
+        try:
+            file_name = os.path.basename(path)
+            if message.kind == "group":
+                uploaded = await self._api.upload_group_file(
+                    message.target_id, data, file_type,
+                    file_name=file_name,
+                )
+            else:
+                uploaded = await self._api.upload_c2c_file(
+                    message.target_id, data, file_type,
+                    file_name=file_name,
+                )
+        except Exception:
+            log.exception("上传文件失败 [%s] target=%s path=%s",
+                          message.kind, message.target_id, path)
+            return
+
+        file_info = ""
+        if isinstance(uploaded, dict):
+            file_info = uploaded.get("file_info") or ""
+        if not file_info:
+            log.warning(
+                "上传结果缺少 file_info，跳过发送 [%s] target=%s path=%s resp=%r",
+                message.kind, message.target_id, path, str(uploaded)[:200],
+            )
+            return
+
+        seq = self._next_seq(message.msg_id)
+        try:
+            if message.kind == "group":
+                await self._api.send_group_file(
+                    message.target_id, file_info, "", message.msg_id, seq
+                )
+            else:
+                await self._api.send_c2c_file(
+                    message.target_id, file_info, "", message.msg_id, seq
+                )
+            log.info(
+                "已发送文件 [%s] -> %s（%d 字节, seq=%d）",
+                message.kind, message.target_id, size, seq,
+            )
+        except APIError as exc:
+            if exc.code == ERR_DUPLICATE_MSG:
+                log.warning(
+                    "文件消息被去重 [%s] target=%s seq=%d",
+                    message.kind, message.target_id, seq,
+                )
+                return
+            log.error(
+                "发送文件失败 [%s] target=%s status=%s code=%s body=%s",
+                message.kind, message.target_id, exc.status, exc.code, exc.body[:300],
+            )
+        except Exception:
+            log.exception(
+                "发送文件失败 [%s] target=%s", message.kind, message.target_id
             )
 
     # 兼容旧调用名

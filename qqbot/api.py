@@ -64,8 +64,10 @@ class QQBotAPI:
         *,
         json_body: Optional[dict] = None,
         params: Optional[dict] = None,
+        timeout: Optional[float] = None,
     ) -> dict:
         last_error: Optional[Exception] = None
+        req_timeout = timeout if timeout is not None else self._timeout
 
         for attempt in (0, 1):
             token = await self._tm.get_token(force=(attempt == 1))
@@ -84,7 +86,7 @@ class QQBotAPI:
                         headers=headers,
                         json=json_body,
                         params=params,
-                        timeout=self._timeout,
+                        timeout=req_timeout,
                     ) as resp:
                         text = await resp.text()
                         if resp.status == 401 and attempt == 0:
@@ -121,7 +123,7 @@ class QQBotAPI:
                 continue
         raise RuntimeError("获取 WebSocket 网关地址失败: " + " | ".join(errors))
 
-    # ---------------- 消息发送 ----------------
+    # ---------------- 文本消息 ----------------
 
     async def send_group_message(
         self,
@@ -176,3 +178,103 @@ class QQBotAPI:
         if msg_id:
             body["msg_id"] = msg_id
         return await self.request("POST", f"/dms/{guild_id}/messages", json_body=body)
+
+    # ---------------- 富媒体上传（文件） ----------------
+    #
+    # 群聊/单聊各一个上传接口，body 二选一：
+    #   {"file_type": 4, "file_data": "<纯 base64>"}
+    #   {"file_type": 4, "url": "<在线链接>"}
+    # 返回 {"file_uuid": ..., "file_info": ..., "ttl": ...}
+    # file_info 才是后面 msg_type=7 发送时需要的东西。
+
+    async def upload_group_file(
+        self,
+        group_openid: str,
+        file_data: str,
+        file_type: int = 4,
+        srv_send_msg: bool = False,
+        timeout: Optional[float] = None,
+        file_name: str = "",
+    ) -> dict:
+        body = {
+            "file_type": int(file_type),
+            "file_data": file_data,
+            "srv_send_msg": bool(srv_send_msg),
+        }
+        # file_type=4（文件）时 file_name 必填，缺省会被平台按“未命名”投递
+        if file_name:
+            body["file_name"] = file_name
+        return await self.request(
+            "POST",
+            f"/v2/groups/{group_openid}/files",
+            json_body=body,
+            timeout=timeout,
+        )
+
+    async def upload_c2c_file(
+        self,
+        user_openid: str,
+        file_data: str,
+        file_type: int = 4,
+        srv_send_msg: bool = False,
+        timeout: Optional[float] = None,
+        file_name: str = "",
+    ) -> dict:
+        body = {
+            "file_type": int(file_type),
+            "file_data": file_data,
+            "srv_send_msg": bool(srv_send_msg),
+        }
+        # file_type=4（文件）时 file_name 必填，缺省会被平台按“未命名”投递
+        if file_name:
+            body["file_name"] = file_name
+        return await self.request(
+            "POST",
+            f"/v2/users/{user_openid}/files",
+            json_body=body,
+            timeout=timeout,
+        )
+
+    # ---------------- 富媒体发送（msg_type=7） ----------------
+
+    async def send_group_file(
+        self,
+        group_openid: str,
+        file_info: str,
+        content: str = "",
+        msg_id: Optional[str] = None,
+        msg_seq: int = 1,
+    ) -> dict:
+        body: dict[str, Any] = {
+            "msg_type": 7,
+            "media": {"file_info": file_info},
+        }
+        if content:
+            body["content"] = content
+        if msg_id:
+            body["msg_id"] = msg_id
+            body["msg_seq"] = msg_seq
+        return await self.request(
+            "POST", f"/v2/groups/{group_openid}/messages", json_body=body
+        )
+
+    async def send_c2c_file(
+        self,
+        user_openid: str,
+        file_info: str,
+        content: str = "",
+        msg_id: Optional[str] = None,
+        msg_seq: int = 1,
+    ) -> dict:
+        body: dict[str, Any] = {
+            "msg_type": 7,
+            "media": {"file_info": file_info},
+        }
+        if content:
+            body["content"] = content
+        if msg_id:
+            body["msg_id"] = msg_id
+            body["msg_seq"] = msg_seq
+        return await self.request(
+            "POST", f"/v2/users/{user_openid}/messages", json_body=body
+        )

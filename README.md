@@ -26,8 +26,11 @@
 | 分段回复合并（避免刷屏 + 规避 msg_seq 上限） | ✅ |
 | 工具调用标签过滤 | ✅ |
 | 图片/音频/视频附件 base64 编码 | ✅ |
+| 文件收发（收：流式落盘 / 发：上传带 `file_name` + msg_type=7 发送） | ✅ |
+| `#skipable sender` 启动注入 + sender 调用回传转发 | ✅ |
 | 首响应宽限期 + 总超时双保护 | ✅ |
 | 消息去重容错（40054005 降级为 warning） | ✅ |
+| 单实例保护（Windows 命名互斥体，防重复连接） | ✅ |
 | WebHook 接入方式 | ⏳ 未实现（当前用 WebSocket，本地无需公网域名） |
 
 ---
@@ -40,8 +43,13 @@ QQ-add-on-for-SynapseAgent/
 ├── check.py                 # 自检：验证凭证 + 网关地址（不建长连接）
 ├── config.example.yaml      # 配置模板
 ├── config.yaml              # 你的实际配置（已在 .gitignore）
+├── downloads/               # 收到的文件（已在 .gitignore）
 ├── requirements.txt
 ├── start.bat                # 双击启动（已处理中文编码）
+├── logs/
+│   ├── run_bot.bat          # 后台启动（stdout/stderr 重定向到 logs/）
+│   ├── restart_bot.ps1      # 延迟重启（等本轮回复送达后替换进程）
+│   └── qqbot.log            # 运行日志
 ├── qqbot/
 │   ├── logger.py            # 日志：控制台 + logs/qqbot.log
 │   ├── config.py            # 配置加载（YAML + 环境变量）
@@ -53,13 +61,15 @@ QQ-add-on-for-SynapseAgent/
 │   ├── agent_client.py      # 后端 Agent HTTP 客户端（解析 result 嵌套结构）
 │   ├── bootstrap.py         # 启动时写入 prompt.md 到后端系统提示词
 │   ├── media.py             # 附件下载 + base64 编码（image/audio/video）
-│   └── bridge.py            # 消息队列 + 投递/轮询 + 合并窗口
+│   ├── files.py             # 文件标签解析 + 流式落盘 + 文件类型
+│   └── bridge.py            # 消息队列 + 投递/轮询 + 合并窗口 + sender 转发
 └── tests/
     ├── offline_check.py         # 事件解析与分发（6 项）
     ├── agent_client_check.py    # Agent 响应解析（8 项）
     ├── agent_bridge_check.py    # 桥接链路（16 项）
     ├── bootstrap_check.py       # 提示词初始化（6 项）
-    └── media_check.py           # 媒体附件处理（13 项）
+    ├── media_check.py           # 媒体附件处理（13 项）
+    └── files_check.py           # 文件收发（18 项）
 ```
 
 ---
@@ -129,6 +139,8 @@ python main.py
 
 或直接双击 `start.bat`。
 
+`main.py` 带**单实例保护**：重复启动会打印「已有实例在运行」并直接退出，不需要手动检查进程。
+
 上线成功日志：
 
 ```
@@ -144,6 +156,7 @@ python -m tests.agent_client_check   # AGENT_CLIENT_CHECK_OK 8 scenarios
 python -m tests.agent_bridge_check   # AGENT_BRIDGE_CHECK_OK 16 scenarios
 python -m tests.bootstrap_check      # BOOTSTRAP_CHECK_OK 6 scenarios
 python -m tests.media_check          # MEDIA_CHECK_OK 13 scenarios
+python -m tests.files_check           # FILES_CHECK_OK 18 scenarios
 ```
 
 各模块覆盖内容：
@@ -155,6 +168,7 @@ python -m tests.media_check          # MEDIA_CHECK_OK 13 scenarios
 | `agent_bridge_check` | 单段/多段合并、窗口过期刷出、空 status=0 等待、宽限期耗尽、超长切分、条数上限、标签剥离、空内容拦截、四种消息类型前缀规则 |
 | `bootstrap_check` | 空文件跳过、文件缺失跳过、payload 格式、残留清理、超时不崩 |
 | `media_check` | 类型识别、base64 编码、超限降级、下载失败、总量预算、非媒体附件 |
+| `files_check` | 标签解析、落盘去重、base64、文件类型、收发与降级（18 项） |
 
 ---
 
@@ -173,6 +187,22 @@ python -m tests.media_check          # MEDIA_CHECK_OK 13 scenarios
 | `agent_pending_timeout` | 单条消息等待上限（秒） | `300.0` |
 | `agent_first_reply_timeout` | 首次拿到内容的宽限期（秒） | `60.0` |
 | `agent_queue_size` | 待投递队列长度 | `32` |
+| `agent_merge_idle` | 合并窗口（秒）：空闲超过该时长才发出 | `15.0` |
+| `agent_include_author` | 群聊是否在内容前加发言者前缀（单聊/频道不加） | `true` |
+| `agent_prompt_file` | 启动时写入后端系统提示词的 md 文件 | `prompt.md` |
+| `agent_prompt_inject_enabled` | 是否启用启动时的提示词注入 | `true` |
+| `agent_prompt_timeout` | 等待后端确认提示词/启动指令的最长时间（秒） | `90.0` |
+| `agent_skipable_cmds` | 提示词注入后逐条投递的启动指令 | `["#skipable sender"]` |
+| `agent_file_enabled` | 是否启用文件收发 | `true` |
+| `agent_file_dir` | 收文件目录（相对项目根） | `downloads` |
+| `agent_file_max_bytes` | 单个入站文件上限，`0` = 不限（流式落盘） | `0` |
+| `agent_file_send_max_bytes` | 单个出站文件上限，`0` = 不限 | `0` |
+| `agent_file_timeout` | 文件下载超时（秒） | `120.0` |
+| `agent_media_enabled` | 是否把媒体附件 base64 交给 Agent | `true` |
+| `agent_media_max_bytes` | 单个附件上限（字节） | `2097152` |
+| `agent_media_total_bytes` | 单条消息附件合计上限（字节） | `8388608` |
+| `agent_media_timeout` | 单个附件下载超时（秒） | `20.0` |
+| `agent_media_url_fallback` | 超限/失败时是否降级为 URL | `true` |
 | `shard` | 分片 `[当前, 总数]` | `[0, 1]` |
 | `token_urls` | access_token 地址（按序回退） | `bots.qq.com` → `api.bot.qq.com` |
 | `api_bases` | OpenAPI 地址（按序回退） | `api.sgroup.qq.com` → `api.bot.qq.com` |
@@ -188,6 +218,23 @@ python -m tests.media_check          # MEDIA_CHECK_OK 13 scenarios
 
 - 默认两者都订阅。
 - 若启动后立即报"无权限/连接被关闭"，说明该事件类型未申请到权限；把 `intents` 改为 `33554432`（仅群聊/单聊）。
+
+### 提示词注入与 BASE_PATH
+
+`agent_prompt_inject_enabled: true` 时，启动流程为：
+
+1. `bootstrap_prompt` 读取 `agent_prompt_file`（默认 `prompt.md`），把 `###BASEPATH###` 替换成 `BASE_PATH` 的绝对路径（正斜杠），
+   以 `#bot prompt PROMPTOVERWRITE<内容>` 投递给后端，**覆盖**其系统提示词
+2. `bootstrap_commands` 逐条投递 `agent_skipable_cmds`（默认 `#skipable sender`）
+3. `bridge.start()` → `gateway.run()`
+
+顺序不可颠倒：提示词覆盖会重建后端的系统消息与命令表，先发的指令会被覆盖；桥接的轮询协程会消费 `answer`，必须最后启动。
+
+**注意**：
+
+- 注入期间网关尚未连接，最长等待 `agent_prompt_timeout`（默认 90s）。这段时间发来的 QQ 消息收不到，属预期行为。
+- `prompt.md` 里必须用 `###BASEPATH###` 占位，**不要**写 `{config['base_path']}` 这类表达式——它不会被替换，会原样进入系统提示词。
+- `BASE_PATH` 写错只会导致提示词里的路径不准，不会阻止启动；目录不存在也不报错。
 
 ---
 
@@ -291,7 +338,73 @@ cmd_hello.__aliases__ = ("hi", "hey")   # /hi、/hey 等价于 /hello
 
 ---
 
-## 七、实现要点
+## 七、文件收发
+
+文件通道完全在 QQ 端实现，**Agent 端代码零改动**。
+
+### 链路
+
+```
+QQ 端启动
+  ① bootstrap_prompt      把 prompt.md 覆盖写入后端系统提示词
+  ② bootstrap_commands    投递 #skipable sender
+  ③ bridge.start()        开始收发
+
+用户发文件 → QQ 端流式落盘 → 消息里出现 [收到文件] 名 -> 绝对路径
+
+Agent 想发文件 → 输出 ‹tool_call›sender D:/xxx/a.zip‹/tool_call›
+              → 后端因 #skipable sender 不执行该工具，把调用文本原样回传
+              → QQ 端解析出路径 → 上传 → 以 msg_type=7 发给当前会话
+```
+
+### 为什么用 `#skipable sender`
+
+后端 `tool_handler.tool()` 命中 `SKIP_CALL` 时**不执行**工具，直接返回
+`sys=‹tool_call›PAUSE‹/tool_call›`、`cli=‹tool_call›原调用‹/tool_call›`；
+CNMD 循环看到 `PAUSE` 就结束本轮，`cli` 进 `msg_stack`，被 `answer` 取走。
+
+于是 `sender` 变成一个「伪工具」：模型以为在调用工具，实际什么都不执行，
+调用文本原封不动回到 QQ 端，由 QQ 端真正发文件。接收方由 QQ 端决定
+（就是最后发消息的那个会话），Agent 端不需要知道发给谁。
+
+### 顺序约束
+
+`bootstrap_prompt` 必须**先于** `bootstrap_commands`：提示词覆盖会重建后端的
+系统消息与命令表，先发的指令会被覆盖。`bridge.start()` 必须**最后**：
+它的轮询协程会消费 `answer`，早启动会与初始化争抢 `msg_stack`。
+
+### 体积
+
+- **收**：流式落盘（`resp.content.iter_chunked`），不把整份内容读进内存，
+  `agent_file_max_bytes: 0` 表示不限。
+- **发**：QQ 上传接口要求整份 `file_data` 在一个请求体里，因此发件时会读完
+  整个文件并 base64（内存约 4/3 文件大小）。`agent_file_send_max_bytes: 0`
+  表示本地不限，实际仍受 QQ 平台侧限制，超限由平台报错兜底。
+
+### 文件名
+
+QQ 富媒体上传接口（`/v2/{groups|users}/{openid}/files`）在 `file_type=4`（文件）时
+**`file_name` 为必填项**。缺省时平台仍返回成功并正常投递，但文件名显示为「未命名」，
+日志里看不出任何异常——这是最容易踩的坑。
+
+`handler._send_file()` 上传时传 `os.path.basename(path)`，`api.py` 两个上传方法
+新增 `file_name` 参数，**非空才写入请求体**（图片/视频等其它 `file_type` 不强制）。
+
+### msg_seq 预算
+
+文本段与文件消息都消耗同一条 `msg_id` 的 `msg_seq`（平台上限 5，留 1 余量 → 4）。
+`bridge._flush()` 会先按文件数量分配预算，剩下的给文本段；超出预算的文件被丢弃并记 warning。
+
+### 降级
+
+| 情况 | 行为 |
+| --- | --- |
+| 文件不存在 / 超出发件上限 | 跳过，记 warning，不影响其它段 |
+| 上传结果缺 `file_info` | 跳过，记 warning |
+| 消息类型是频道/频道私信 | 跳过（平台不支持发文件） |
+| 收件下载失败 | 消息里降级为 `[附件] 名` |
+| 文件收发整体关闭 | 收：降级为 `[附件] 名`；发：静默跳过 |
+## 八、实现要点
 
 - **鉴权**：`POST /app/getAppAccessToken`，`Authorization: QQBot {access_token}`。token 有效期约 7200s，过期前 60s 内请求会拿到新 token。
 - **被动回复**：群聊/单聊回复必须带原消息 `msg_id`，且同一条消息的 `msg_seq` 需递增（已自动维护）。
@@ -300,10 +413,16 @@ cmd_hello.__aliases__ = ("hi", "hey")   # /hi、/hey 等价于 /hello
 - **长度限制**：单条回复超过 1800 字符自动截断。
 - **不阻塞收包**：事件处理通过 `asyncio.create_task` 并发执行，避免单条消息处理慢拖垮心跳。
 - **双地址回退**：`api.bot.qq.com` 与 `api.sgroup.qq.com` 都支持，失败自动切换。
+- **单实例保护**：`main.py` 启动时创建 Windows 命名互斥体
+  （`Global\\QQ-addon-SynapseAgent-Mutex`），已存在则记 error 并以返回码 3 退出。
+  进程退出时系统自动释放，无需 pid 文件。多实例会各自建一条网关连接，
+  导致同一事件被处理两次、并触发平台 `40054005` 去重。
+- **文件上传带文件名**：`file_type=4` 时 `file_name` 缺失会显示「未命名」，
+  由 `_send_file()` 用 `os.path.basename(path)` 补齐。
 
 ---
 
-## 八、常见问题
+## 九、常见问题
 
 | 现象 | 排查方向 |
 | --- | --- |
@@ -317,12 +436,16 @@ cmd_hello.__aliases__ = ("hi", "hey")   # /hi、/hey 等价于 /hello
 | 日志出现 `消息被去重` | 多实例同时在线，检查是否跑了多个 `main.py` |
 | 只收到部分回复 | 内容超长被切分/截断，属预期行为 |
 | 回复里带奇怪标签 | 已在 `bridge.py` 过滤；若 Agent 新增标签需同步扩展正则 |
+| 收到了文件但没落盘 | 查看日志 `文件保存失败`；确认 `agent_file_enabled: true` 与 `agent_file_dir` 可写 |
+| Agent 不会主动发文件 | 确认 `agent_skipable_cmds` 含 `#skipable sender`，且 `prompt.md` 含「文件收发」小节 |
+| 收到的文件显示「未命名」 | 上传请求缺 `file_name`；确认 `_send_file()` 传了 `os.path.basename(path)`，`api.py` 写入请求体 |
+| 启动即退出、日志「已有实例在运行」 | 单实例锁生效，已有 `main.py` 在跑；确认进程后重启 |
 
 日志位置：`logs/qqbot.log`
 
 ---
 
-## 九、已知限制
+## 十、已知限制
 
 **全局单会话串行**：同一时刻只有一条消息在等 Agent 回复。后果是——A 用户的任务正在生成时，B、C 用户的消息会排队等待，要等 A 完成才轮到。
 
